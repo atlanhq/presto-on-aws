@@ -1,0 +1,87 @@
+{
+	"variables": {
+		"subnet_id": "",
+		"vpc_id": "",
+		"aws_access_key": "",
+		"aws_secret_key": "",
+		"presto_version": "",
+		"ami_name": "",
+		"environment": "dev",
+        "source_ami": "",
+        "region": ""
+	},
+	"builders": [{
+		"type": "amazon-ebs",
+		"region": "{{ user `region` }}",
+		"source_ami": "{{ user `source_ami` }}",
+		"instance_type": "t3a.large",
+		"ssh_username": "ec2-user",
+		"ssh_timeout": "5m",
+		"ami_name": "{{ user `ami_name`}}",
+		"vpc_id": "{{ user `vpc_id` }}",
+		"subnet_id": "{{ user `subnet_id` }}",
+		"force_deregister": true,
+		"run_tags": {
+			"Name": "atlan-presto"
+		},
+		"tags": {
+			"Name": "Atlan-Presto",
+			"Environment": "{{ user `environment` }}",
+			"user": "arpit",
+			"presto_version": "{{ user `presto_version` }}"
+		},
+		"ami_block_device_mappings": [
+			{
+				"device_name": "/dev/xvda",
+				"volume_size": 8,
+				"delete_on_termination": true
+			}
+		]
+	}],
+	"provisioners": [
+		{
+			"type": "shell",
+			"inline": [
+				"sudo mkdir -p /etc/presto",
+				"sudo mkdir -p /etc/presto_metrics",
+				"sudo chown -R ec2-user:ec2-user /etc/presto /etc/presto_metrics"
+			]
+		},
+		{
+			"type": "file",
+			"source": "./presto",
+			"destination": "/tmp/presto"
+		},
+		{
+			"type": "file",
+			"source": "./presto_metrics_prometheus.service",
+			"destination": "/tmp/presto_metrics_prometheus.service"
+		},
+		{
+			"type": "file",
+			"source": "./presto_metrics_cloudwatch.service",
+			"destination": "/tmp/presto_metrics_cloudwatch.service"
+		},
+		{
+			"type": "file",
+			"source": "./presto_scaling_service.service",
+			"destination": "/tmp/presto_scaling_service.service"
+		},
+		{
+			"type": "file",
+			"source": "./base_configs/",
+			"destination": "/etc/presto"
+		},
+		{
+		    "type": "shell",
+			"environment_vars": [
+				"aws_access_key={{ user `aws_access_key`}}",
+				"aws_secret_key={{ user `aws_secret_key`}}",
+				"presto_version={{ user `presto_version`}}"
+            ],
+		    "scripts": [
+		        "presto.sh"
+		    ]
+		}
+	]
+}

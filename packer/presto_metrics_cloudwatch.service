@@ -1,0 +1,21 @@
+[Unit]
+Description=Presto Metrics Prometheus exporter
+[Service]
+User=ec2-user
+#change this to your workspace
+EnvironmentFile=/etc/presto_metrics/env.cloudwatch
+WorkingDirectory=/etc/presto_metrics/
+#path to executable.
+ExecStart=/usr/local/bin/presto_metrics --web.service-name=${SERVICE_NAME} \
+										--web.presto-host=${PRESTO_HOST} \
+										--web.presto-port=${PRESTO_PORT} \
+										--web.stack-name=${STACK_NAME} \
+										--web.cloudwatch-namespace=${CLOUDWATCH_NAMESPACE} \
+										--web.api-prefix=${API_PREFIX} \
+										--web.cloudwatch-region=${CLOUDWATCH_REGION}
+SuccessExitStatus=143
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target

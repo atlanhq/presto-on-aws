@@ -1,0 +1,18 @@
+[Unit]
+Description=Presto Scaling Service
+[Service]
+User=ec2-user
+#change this to your workspace
+EnvironmentFile=/etc/presto_scaling_service/env
+WorkingDirectory=/etc/presto_scaling_service
+#path to executable.
+ExecStart=/usr/local/bin/presto_scaling_service --web.presto-host=${PRESTO_HOST} \
+												--web.presto-port=${PRESTO_PORT} \
+												--web.workers-asg-name=${PRESTO_WORKERS_ASG_NAME} \
+												--web.api-prefix=${API_PREFIX}
+SuccessExitStatus=143
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target

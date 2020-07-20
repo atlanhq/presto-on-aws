@@ -1,0 +1,1354 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation Template for OpenSource Presto'
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "AWS Configuration"
+        Parameters:
+          - VPC
+          - Subnet
+          - KeyName
+          - SecurityGroups
+      -
+        Label:
+          default: "Presto Configuration"
+        Parameters:
+          - CoordinatorInstanceType
+          - WorkersInstanceType
+          - WorkersCount
+          - Ec2RootVolumeSize
+          - MaxWorkersCount
+      -
+        Label:
+          default: "Additional Parameters"
+        Parameters:
+          - Environment
+
+Mappings:
+  RegionMap:
+    ap-south-1:
+      PRESTOIMAGE: ami-0bcffb0a9872eb14c
+    us-east-1:
+      PRESTOIMAGE: ami-04254dc35836a5c71
+
+Parameters:
+  VPC:
+    Type: 'AWS::EC2::VPC::Id'
+    #aws-permission @cft ec2:DescribeVpcs
+    Description: VPC ID
+    AllowedPattern: ".+"
+  Subnet:
+    Type: 'AWS::EC2::Subnet::Id'
+    #aws-permission @cft ec2:DescribeSubnets
+    Description: Subnet to use for Presto nodes (must belong to the selected VPC)
+    AllowedPattern: ".+"
+  KeyName:
+    Description: EC2 Key Name
+    Type: AWS::EC2::KeyPair::KeyName
+    #aws-permission @cft ec2:DescribeKeyPairs
+    AllowedPattern: ".+"
+  SecurityGroups:
+    Type: 'List<AWS::EC2::SecurityGroup::Id>'
+    #aws-permission @cft ec2:DescribeSecurityGroups
+    Description: 'Security Groups for Presto nodes (e.g: allowing SSH access). Must select at least one.'
+    AllowedPattern: ".+"
+  CoordinatorInstanceType:
+    Type: String
+    Default: m5.large
+    Description: EC2 instance type of the coordinator
+  CoordinatorInstanceCount:
+    Type: String
+    Default: 1
+    Description: Number of Coordinator instances to deploy
+  WorkersInstanceType:
+    Type: String
+    Default: m5.large
+    Description: EC2 instance type of the workers
+  ElasticsearchHost:
+    Type: String
+    Default: dev-admin-search.atlan.com
+  ElasticsearchPort:
+    Type: "String"
+    Default: 443
+  AdditionalConfigsUri:
+    Type: "String"
+    Description: Additional Configuration zip file to use, provide an https s3 public url to fetch the zip file from.
+  WorkersCount:
+    Description: Number of dedicated Presto worker nodes (apart from coordinator) to instantiate.
+    Type: Number
+    Default: 1
+    MinValue: 1
+  MaxWorkersCount:
+    Description: Number of max dedicated Presto worker nodes.
+    Type: Number
+    Default: 5
+    MinValue: 1
+  Ec2RootVolumeSize:
+    Type: String
+    Default: 100
+    Description: EC2 root volume size
+  HiveIPAddress:
+    Type: String
+    Default: thrift://emr.dev.services:9083
+    Description: Hive IP Address
+  Environment:
+    Type: String
+    Description: Presto Launch Environment
+    AllowedValues:
+      - dev
+      - prod
+    Default: "dev"
+  PrestoVersion:
+    Type: String
+    Default: 330
+    Description: Presto Version which is being deployed
+
+Resources:
+  PrestoSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    #aws-permission @cft ec2:CreateSecurityGroup
+    #aws-permission @cft ec2:DeleteSecurityGroup
+    Properties:
+      GroupDescription: Presto nodes Security Group
+      VpcId: !Ref VPC
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-presto-sg" }
+        - { Key: "presto:opensource:identification:role", Value: "presto:security-group" }
+  PrestoHttpsOutboundRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    #aws-permission @cft ec2:AuthorizeSecurityGroupEgress
+    #aws-permission @cft ec2:RevokeSecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: '443'
+      ToPort: '443'
+      CidrIp: 0.0.0.0/0
+      GroupId: !GetAtt PrestoSecurityGroup.GroupId
+  PrestoOutboundRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    #aws-permission @cft ec2:AuthorizeSecurityGroupEgress
+    #aws-permission @cft ec2:RevokeSecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: '8080'
+      ToPort: '8080'
+      DestinationSecurityGroupId: !GetAtt PrestoSecurityGroup.GroupId
+      GroupId: !GetAtt PrestoSecurityGroup.GroupId
+  PrestoInboundRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    #aws-permission @cft ec2:AuthorizeSecurityGroupIngress
+    #aws-permission @cft ec2:RevokeSecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: '8080'
+      ToPort: '8080'
+      SourceSecurityGroupId: !GetAtt PrestoSecurityGroup.GroupId
+      GroupId: !GetAtt PrestoSecurityGroup.GroupId
+  PrestoClusterIAMRole:
+    Type: AWS::IAM::Role
+    #aws-permission @cft iam:CreateRole
+    #aws-permission @cft iam:DeleteRole
+    # Condition: CreateIamInstanceProfile
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-presto-cluster-iam-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ec2.amazonaws.com, apigateway.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Policies:
+        #aws-permission @cft iam:AttachRolePolicy
+        #aws-permission @cft iam:DeleteRolePolicy
+        #aws-permission @cft iam:DetachRolePolicy
+        #aws-permission @cft iam:PutRolePolicy
+        - PolicyName: !Sub ${AWS::StackName}-presto-cf-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "autoscaling:CompleteLifecycleAction"
+                  - "autoscaling:RecordLifecycleActionHeartbeat"
+                  - "autoscaling:DescribeAutoScalingGroups"
+                  - "autoscaling:PutScalingPolicy"
+                  - "autoscaling:DescribeAutoScalingInstances"
+                  - "autoscaling:DescribeLaunchConfigurations"
+                  - "autoscaling:DescribeScalingActivities"
+                  - "autoscaling:UpdateAutoScalingGroup"
+                  - "autoscaling:SetDesiredCapacity"
+                  - "cloudformation:SignalResource"
+                  - "ec2:DescribeInstances"
+                  - "glue:BatchGetPartition"
+                  - "glue:BatchCreatePartition"
+                  - "glue:CreateDatabase"
+                  - "glue:CreateTable"
+                  - "glue:DeleteDatabase"
+                  - "glue:DeletePartition"
+                  - "glue:DeleteTable"
+                  - "glue:GetDatabase"
+                  - "glue:GetDatabases"
+                  - "glue:GetPartition"
+                  - "glue:GetPartitions"
+                  - "glue:GetTable"
+                  - "glue:GetTables"
+                  - "glue:UpdateTable"
+                  - "glue:UpdatePartition"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:PutObject"
+                  - "sqs:ChangeMessageVisibility"
+                  - "sqs:DeleteMessage"
+                  - "sqs:GetQueueUrl"
+                  - "sqs:ReceiveMessage"
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:PutRetentionPolicy"
+                  - "logs:DescribeLogGroups"
+                  - "logs:DescribeLogStreams"
+                  - "cloudwatch:PutMetricData"
+                  - "ec2:CreateNetworkInterface"
+                  - "ec2:DescribeNetworkInterfaces"
+                  - "ec2:DeleteNetworkInterface"
+                  - "ec2:AttachNetworkInterface"
+                  - "ec2:DetachNetworkInterface"
+                  - "ec2:DescribeNetworkInterfaceAttribute"
+                Resource:
+                  - "*"
+  PrestoClusterInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    #aws-permission @cft iam:CreateInstanceProfile
+    #aws-permission @cft iam:DeleteInstanceProfile
+    #aws-permission @cft iam:GetRole
+    #aws-permission @cft iam:AddRoleToInstanceProfile
+    #aws-permission @cft iam:RemoveRoleFromInstanceProfile
+    Properties:
+      Roles:
+        - Ref: PrestoClusterIAMRole
+  CoordinatorENI:
+    Type: 'AWS::EC2::NetworkInterface'
+    #aws-permission @cft ec2:CreateNetworkInterface
+    #aws-permission @cft ec2:DescribeNetworkInterfaces
+    #aws-permission @cft ec2:ModifyNetworkInterfaceAttribute
+    #aws-permission @cft ec2:DeleteNetworkInterface
+    Properties:
+      Description: !Sub "${AWS::StackName} coordinator ENI"
+      GroupSet: !Split
+        - ','
+        - !Join
+          - ','
+          - - !GetAtt PrestoSecurityGroup.GroupId
+            - !Join
+              - ','
+              - !Ref SecurityGroups
+      SubnetId: !Ref Subnet
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-coordinator-ENI" }
+        - { Key: "presto:opensource:identification:role", Value: "presto:coordinator-eni" }
+
+  PrestoCoordinatorServerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /prestosql/presto/${AWS::StackName}/coordinators/server
+      RetentionInDays: 7
+  PrestoCoordinatorSyslogLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /prestosql/presto/${AWS::StackName}/coordinators/syslog
+      RetentionInDays: 3
+  PrestoWorkerServerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /prestosql/presto/${AWS::StackName}/workers/server
+      RetentionInDays: 1
+  PrestoWorkerSyslogLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /prestosql/presto/${AWS::StackName}/workers/syslog
+      RetentionInDays: 1
+  
+  Coordinator:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    #aws-permission @cft autoscaling:CreateLaunchConfiguration
+    #aws-permission @cft autoscaling:DeleteLaunchConfiguration
+    #aws-permission @cft autoscaling:DescribeLaunchConfigurations
+    Properties:
+      InstanceType: !Ref CoordinatorInstanceType
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", PRESTOIMAGE]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            VolumeSize: !Ref Ec2RootVolumeSize
+            VolumeType: gp2
+      KeyName: !Ref KeyName
+      #aws-permission @cft iam:GetInstanceProfile
+      IamInstanceProfile: !Ref PrestoClusterInstanceProfile
+      SecurityGroups: !Split
+        - ','
+        - !Join
+          - ','
+          - - !GetAtt PrestoSecurityGroup.GroupId
+            - !Join
+              - ','
+              - !Ref SecurityGroups
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            set -xtrace
+            
+            sed -i -e "s/{{isCoordinator}}/true/g" /etc/presto/config.properties
+            sed -i -e "s#{{coordinatorDiscoveryUri}}#http://localhost:8080#g" /etc/presto/config.properties
+            echo "" >> /etc/presto/config.properties
+            echo discovery-server.enabled=true >> /etc/presto/config.properties
+
+            R=$(($(grep MemTotal /proc/meminfo | awk '{print $2}')/1048576))
+            X=$(($R*8/10))
+            sed -i -e "s/{{jvmMemory}}/$X/g" /etc/presto/jvm.config
+            sed -i -e "s/{{envName}}/${Environment}/g" /etc/presto/node.properties
+            sed -i -e "s/{{instanceId}}/$(curl http://169.254.169.254/latest/meta-data/instance-id/)/g" /etc/presto/node.properties
+            
+            Z=$(($X*6/10))
+            echo "query.max-memory-per-node="$Z"GB" >> /etc/presto/config.properties
+
+            Y=$(($X*7/10))
+            echo "query.max-total-memory-per-node="$Y"GB" >> /etc/presto/config.properties
+
+            echo "query.max-memory=1PB" >> /etc/presto/config.properties
+            echo "query.low-memory-killer.policy=total-reservation-on-blocked-nodes" >> /etc/presto/config.properties
+            
+            sudo tee /etc/awslogs/awslogs.conf > /dev/null <<EOT
+            [general]
+            state_file = /tmp/awslogs.state
+            [/var/log/prsto/server.log]
+            file = /var/log/presto/server.log
+            datetime_format = %b %d %H:%M:%S
+            initial_position = start_of_file
+            log_group_name = ${PrestoCoordinatorServerLogGroup}
+            log_stream_name = {instance_id}
+
+            [/var/log/messages]
+            datetime_format = %b %d %H:%M:%S
+            file = /var/log/messages
+            buffer_duration = 5000
+            initial_position = start_of_file
+            log_group_name = ${PrestoCoordinatorSyslogLogGroup}
+            log_stream_name = {instance_id}
+            EOT
+            sudo tee /etc/awslogs/awscli.conf > /dev/null <<EOT
+            [plugins]
+            cwlogs = cwlogs
+            [default]
+            region = ${AWS::Region}
+            EOT
+
+            sudo tee /etc/presto/catalog/hive.properties > /dev/null <<EOT
+            connector.name=hive-hadoop2
+            hive.metastore.uri=${HiveIPAddress}
+            EOT
+
+            sudo tee /etc/presto_cw_agent.conf > /dev/null <<EOT
+            PRESTO_STACK_NAME=${AWS::StackName}
+            EOT
+
+            wget -O /tmp/presto_config.zip ${AdditionalConfigsUri}
+            unzip /tmp/presto_config.zip -d /tmp/
+            cat /tmp/config/config.properties >> /etc/presto/config.properties
+            cat /tmp/config/catalog/hive.properties >> /etc/presto/catalog/hive.properties
+            cp /tmp/config/catalog/jmx.properties /etc/presto/catalog/jmx.properties
+            cp /tmp/config/catalog/tpch.properties /etc/presto/catalog/tpch.properties
+            cp /tmp/config/catalog/tpcds.properties /etc/presto/catalog/tpcds.properties
+
+            mkdir -p /usr/lib/presto/plugin/atlan-audit-logger-presto-experimental/
+            rm -rf /usr/lib/presto/plugin/atlan-audit-logger-presto-experimental/*
+            wget -O /usr/lib/presto/plugin/atlan-audit-logger-presto-experimental/QueryAuditEventListener-1.4-prestosql.jar https://github.com/atlanhq/presto-query-logger/releases/download/v1.3/presto-query-logger-1.3.jar
+
+            mkdir /usr/lib/presto/etc/
+            sudo tee /usr/lib/presto/etc/event-listener.properties > /dev/null <<EOT
+            event-listener.name=atlan-audit-logger
+            es-host=${ElasticsearchHost}
+            es-port=${ElasticsearchPort}
+            es-protocol=http
+            es-type=_doc
+            EOT
+
+            prestoVersion=$((${PrestoVersion}+0))
+            apiPrefix='v1/'
+
+            if (( $prestoVersion > 329 )); then
+              echo "Presto version greater than 329"
+                apiPrefix='ui/api/'
+            fi
+
+
+            cat <<EOF > /etc/presto_metrics/env.prometheus
+            PRESTO_HOST=localhost
+            PRESTO_PORT=8080
+            SERVICE_NAME=prometheus
+            STACK_NAME=${AWS::StackName}
+            CLOUDWATCH_NAMESPACE=presto
+            API_PREFIX=$apiPrefix
+            EOF
+
+            cat <<EOF > /etc/presto_metrics/env.cloudwatch
+            PRESTO_HOST=localhost
+            PRESTO_PORT=8080
+            SERVICE_NAME=cloudwatch
+            STACK_NAME=${AWS::StackName}
+            CLOUDWATCH_NAMESPACE=presto
+            CLOUDWATCH_REGION=${AWS::Region}
+            API_PREFIX=$apiPrefix
+            EOF
+
+
+            systemctl start awslogsd
+            service presto start
+
+            HTTP_URL="http://localhost:8080/v1/status"
+            CURL_CMD="curl -w httpcode=%{http_code}"
+
+            # -m, --max-time <seconds> FOR curl operation
+            CURL_MAX_CONNECTION_TIMEOUT="-m 5"
+
+            # perform curl operation
+
+            for i in {1..30}
+              do
+                sleep 5
+                CURL_RETURN_CODE=0
+                CURL_OUTPUT=`$CURL_CMD $CURL_MAX_CONNECTION_TIMEOUT $HTTP_URL 2> /dev/null` || CURL_RETURN_CODE=$?
+                if [ $CURL_RETURN_CODE -ne 0 ]; then
+                  echo "Curl connection failed with return code - $CURL_RETURN_CODE"
+                else
+                  echo "Success"
+                  break
+                fi
+              done
+
+
+            if [ $CURL_RETURN_CODE -ne 0 ]; then
+                /opt/aws/bin/cfn-signal -s 'false' --stack ${AWS::StackName} --resource Coordinators --region ${AWS::Region}
+            else
+               systemctl start presto_metrics_prometheus.service
+               systemctl start presto_metrics_cloudwatch.service
+               /opt/aws/bin/cfn-signal -s 'true' --stack ${AWS::StackName} --resource Coordinators --region ${AWS::Region}
+
+            fi
+  Coordinators:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    #aws-permission @cft autoscaling:CreateAutoScalingGroup
+    #aws-permission @cft autoscaling:DeleteAutoScalingGroup
+    #aws-permission @cft autoscaling:DescribeAutoScalingGroups
+    #aws-permission @cft autoscaling:UpdateAutoScalingGroup
+    #aws-permission @cft autoscaling:DescribeScalingActivities
+    #aws-permission @cft autoscaling:DescribeLaunchConfigurations
+    #aws-permission @cft autoscaling:DescribeAutoScalingInstances
+    #aws-permission @cft ec2:CreateTags
+    #aws-permission @cft ec2:RunInstances
+    #aws-permission @cft ec2:TerminateInstances
+    #aws-permission @cft ec2:DescribeInstances
+    UpdatePolicy:
+      # Make updates to LaunchConfiguration cause rolling update of coordinators
+      AutoScalingReplacingUpdate:
+        WillReplace: true
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+        Count: !Ref CoordinatorInstanceCount
+    Properties:
+      LaunchConfigurationName: !Ref Coordinator
+      VPCZoneIdentifier:
+        - !Ref Subnet
+      MinSize: !Ref CoordinatorInstanceCount
+      MaxSize: !Ref CoordinatorInstanceCount
+      DesiredCapacity: !Ref CoordinatorInstanceCount
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-presto-coordinator", PropagateAtLaunch: true }
+        - { Key: "presto:opensource:identification:role", Value: "presto:coordinator", PropagateAtLaunch: true }
+      HealthCheckGracePeriod: 300
+      HealthCheckType: ELB
+      LoadBalancerNames: !Split
+        - ','
+        - !Join
+          - ','
+          - - !Ref PrestoCoordinatorsELB
+  Worker:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    #aws-permission @cft autoscaling:CreateLaunchConfiguration
+    #aws-permission @cft autoscaling:DeleteLaunchConfiguration
+    #aws-permission @cft autoscaling:DescribeLaunchConfigurations
+    #aws-permission @cft autoscaling:UpdateAutoScalingGroup
+    Properties:
+      InstanceType: !Ref WorkersInstanceType
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", PRESTOIMAGE]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            VolumeSize: !Ref Ec2RootVolumeSize
+            VolumeType: gp2
+      KeyName: !Ref KeyName
+      #aws-permission @cft iam:GetInstanceProfile
+      IamInstanceProfile: !Ref PrestoClusterInstanceProfile
+      SecurityGroups: !Split
+        - ','
+        - !Join
+          - ','
+          - - !GetAtt PrestoSecurityGroup.GroupId
+            - !Join
+              - ','
+              - !Ref SecurityGroups
+      # When worker has private IP only, following things are problematic:
+      #  - S3 cannot be accessed (can be fixed with NAT box in VPC or "VPC endpoint for S3")
+      #  - EC2 boot is very long, as it includes `yum upgrade` which retries timeouts (can
+      #    be fixed with NAT box in VPC or "repo_upgrade: none" in cloud init)
+      #AssociatePublicIpAddress: false
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            set -xtrace
+
+            sed -i -e "s/{{isCoordinator}}/false/g" /etc/presto/config.properties
+            sed -i -e "s#{{coordinatorDiscoveryUri}}#http://${CoordinatorENI.PrimaryPrivateIpAddress}:8080#g" /etc/presto/config.properties
+
+            R=$(($(grep MemTotal /proc/meminfo | awk '{print $2}')/1048576))
+            X=$(($R*8/10))
+            sed -i -e "s/{{jvmMemory}}/$X/g" /etc/presto/jvm.config
+            sed -i -e "s/{{envName}}/${Environment}/g" /etc/presto/node.properties
+            sed -i -e "s/{{instanceId}}/$(curl http://169.254.169.254/latest/meta-data/instance-id/)/g" /etc/presto/node.properties
+            
+            echo "" >> /etc/presto/config.properties
+
+            Z=$(($X*6/10))
+            echo "query.max-memory-per-node="$Z"GB" >> /etc/presto/config.properties
+
+            Y=$(($X*7/10))
+            echo "query.max-total-memory-per-node="$Y"GB" >> /etc/presto/config.properties
+            echo "query.low-memory-killer.policy=total-reservation-on-blocked-nodes" >> /etc/presto/config.properties
+
+            sudo tee /etc/awslogs/awslogs.conf > /dev/null <<EOT
+            [general]
+            state_file = /tmp/awslogs.state
+            [/var/log/prsto/server.log]
+            file = /var/log/presto/server.log
+            datetime_format = %b %d %H:%M:%S
+            initial_position = start_of_file
+            log_group_name = ${PrestoWorkerServerLogGroup}
+            log_stream_name = {instance_id}
+
+            [/var/log/messages]
+            datetime_format = %b %d %H:%M:%S
+            file = /var/log/messages
+            buffer_duration = 5000
+            initial_position = start_of_file
+            log_group_name = ${PrestoWorkerSyslogLogGroup}
+            log_stream_name = {instance_id}
+            EOT
+            sudo tee /etc/awslogs/awscli.conf > /dev/null <<EOT
+            [plugins]
+            cwlogs = cwlogs
+            [default]
+            region = ${AWS::Region}
+            EOT
+
+            sudo tee /etc/presto/catalog/hive.properties > /dev/null <<EOT
+            connector.name=hive-hadoop2
+            hive.metastore.uri=${HiveIPAddress}
+            EOT
+
+            wget -O /tmp/presto_config.zip ${AdditionalConfigsUri}
+            unzip /tmp/presto_config.zip -d /tmp/
+            cat /tmp/config/config.properties >> /etc/presto/config.properties
+            cat /tmp/config/catalog/hive.properties >> /etc/presto/catalog/hive.properties
+            cp /tmp/config/catalog/jmx.properties /etc/presto/catalog/jmx.properties
+            cp /tmp/config/catalog/tpch.properties /etc/presto/catalog/tpch.properties
+            cp /tmp/config/catalog/tpcds.properties /etc/presto/catalog/tpcds.properties
+
+            mkdir /usr/lib/presto/plugin/atlan-audit-logger-presto-experimental/
+            mkdir /usr/lib/presto/etc/
+            rm -rf /usr/lib/presto/plugin/atlan-audit-logger-presto-experimental/*
+            wget -O /usr/lib/presto/plugin/atlan-audit-logger-presto-experimental/QueryAuditEventListener-1.4-prestosql.jar https://athena-cloudformation-templates.s3.ap-south-1.amazonaws.com/unilever/config/QueryAuditEventListener-1.4-prestosql-jar-with-dependencies.jar
+
+            sudo tee /usr/lib/presto/etc/event-listener.properties > /dev/null <<EOT
+            event-listener.name=atlan-audit-logger
+            es-host=${ElasticsearchHost}
+            es-port=${ElasticsearchPort}
+            es-protocol=http
+            es-type=_doc
+            EOT
+
+            prestoVersion=$((${PrestoVersion}+0))
+            apiPrefix='v1/'
+
+            if (( $prestoVersion > 329 )); then
+                echo "Presto version greater than 329"
+                apiPrefix='ui/api/'
+            fi
+
+
+            cat <<EOF > /etc/presto_metrics/env.prometheus
+            PRESTO_HOST=localhost
+            PRESTO_PORT=8080
+            SERVICE_NAME=prometheus
+            STACK_NAME=${AWS::StackName}
+            CLOUDWATCH_NAMESPACE=presto
+            API_PREFIX=$apiPrefix
+            EOF
+
+            cat <<EOF > /etc/presto_metrics/env.cloudwatch
+            PRESTO_HOST=localhost
+            PRESTO_PORT=8080
+            SERVICE_NAME=cloudwatch
+            STACK_NAME=${AWS::StackName}
+            CLOUDWATCH_NAMESPACE=presto
+            API_PREFIX=$apiPrefix
+            EOF
+            
+            systemctl start awslogsd
+            service presto start
+
+            HTTP_URL="http://localhost:8080/v1/status"
+            CURL_CMD="curl -w httpcode=%{http_code}"
+
+            # -m, --max-time <seconds> FOR curl operation
+            CURL_MAX_CONNECTION_TIMEOUT="-m 5"
+
+            # perform curl operation
+
+            for i in {1..30}
+              do
+                sleep 5
+                CURL_RETURN_CODE=0
+                CURL_OUTPUT=`$CURL_CMD $CURL_MAX_CONNECTION_TIMEOUT $HTTP_URL 2> /dev/null` || CURL_RETURN_CODE=$?
+                if [ $CURL_RETURN_CODE -ne 0 ]; then
+                  echo "Curl connection failed with return code - $CURL_RETURN_CODE"
+                else
+                  echo "Success"
+                  break
+                fi
+              done
+
+            if [ $CURL_RETURN_CODE -ne 0 ]; then
+                /opt/aws/bin/cfn-signal -s 'false' --stack ${AWS::StackName} --resource Workers --region ${AWS::Region}
+            else
+                systemctl start presto_metrics_prometheus.service
+                systemctl start presto_metrics_cloudwatch.service
+               /opt/aws/bin/cfn-signal -s 'true' --stack ${AWS::StackName} --resource Workers --region ${AWS::Region}
+            fi
+
+  Workers:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    #aws-permission @cft autoscaling:CreateAutoScalingGroup
+    #aws-permission @cft autoscaling:DeleteAutoScalingGroup
+    #aws-permission @cft autoscaling:DescribeAutoScalingGroups
+    #aws-permission @cft autoscaling:UpdateAutoScalingGroup
+    #aws-permission @cft autoscaling:DescribeScalingActivities
+    #aws-permission @cft autoscaling:DescribeLaunchConfigurations
+    #aws-permission @cft autoscaling:DescribeAutoScalingInstances
+    #aws-permission @cft ec2:CreateTags
+    #aws-permission @cft ec2:RunInstances
+    #aws-permission @cft ec2:TerminateInstances
+    #aws-permission @cft ec2:DescribeInstances
+    UpdatePolicy:
+      # Make updates to LaunchConfiguration cause rolling update of workers
+      AutoScalingReplacingUpdate:
+        WillReplace: true
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+        Count: !Ref WorkersCount
+    Properties:
+      LaunchConfigurationName: !Ref Worker
+      MetricsCollection:
+        - Granularity: "1Minute"
+      VPCZoneIdentifier:
+        - !Ref Subnet
+      MinSize: !Ref WorkersCount
+      MaxSize: !Ref MaxWorkersCount
+      DesiredCapacity: !Ref WorkersCount
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-presto-worker", PropagateAtLaunch: true }
+        - { Key: "presto:opensource:identification:role", Value: "presto:worker", PropagateAtLaunch: true }
+      HealthCheckGracePeriod: 180
+      HealthCheckType: ELB
+      LoadBalancerNames: !Split
+        - ','
+        - !Join
+          - ','
+          - - !Ref PrestoWorkersELB
+  WorkersScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName:
+        Ref: Workers
+      Cooldown: '60'
+      ScalingAdjustment: '1'
+  WorkersScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName:
+        Ref: Workers
+      Cooldown: '60'
+      ScalingAdjustment: "-1"
+  WorkersUserCPUAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-up if CPU > 70% for 1 minutes
+      MetricName: MeanWorkerUserCPUUtilisation
+      Namespace: presto
+      Statistic: Average
+      Period: '120'
+      EvaluationPeriods: '1'
+      Threshold: '0.7'
+      AlarmActions:
+      - Ref: WorkersScaleUpPolicy
+      Dimensions:
+      - Name: prestoStackName
+        Value:
+          Ref: "AWS::StackName"
+      ComparisonOperator: GreaterThanThreshold
+  WorkersUserCPUAlarmLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-down if CPU < 50% for 5 minutes
+      MetricName: MeanWorkerUserCPUUtilisation
+      Namespace: presto
+      Statistic: Average
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '0.5'
+      AlarmActions:
+      - Ref: WorkersScaleDownPolicy
+      Dimensions:
+      - Name: prestoStackName
+        Value:
+          Ref: "AWS::StackName"
+      ComparisonOperator: LessThanThreshold
+
+  WorkersSystemCPUAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-up if CPU > 70% for 1 minutes
+      MetricName: MeanWorkerSystemCPUUtilisation
+      Namespace: presto
+      Statistic: Average
+      Period: '120'
+      EvaluationPeriods: '1'
+      Threshold: '0.7'
+      AlarmActions:
+      - Ref: WorkersScaleUpPolicy
+      Dimensions:
+      - Name: prestoStackName
+        Value:
+          Ref: "AWS::StackName"
+      ComparisonOperator: GreaterThanThreshold
+  WorkersSystemCPUAlarmLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-down if CPU < 50% for 5 minutes
+      MetricName: MeanWorkerSystemCPUUtilisation
+      Namespace: presto
+      Statistic: Average
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '0.5'
+      AlarmActions:
+      - Ref: WorkersScaleDownPolicy
+      Dimensions:
+      - Name: prestoStackName
+        Value:
+          Ref: "AWS::StackName"
+      ComparisonOperator: LessThanThreshold
+
+  GracefulNodeShutdownQueueIAMRole:
+    Type: AWS::IAM::Role
+    #aws-permission @cft iam:CreateRole
+    #aws-permission @cft iam:DeleteRole
+    #Condition: CreateIamInstanceProfile
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-graceful-shutdown-iam-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - lambda.amazonaws.com
+            Action: ['sts:AssumeRole']
+      Policies:
+        #aws-permission @cft iam:AttachRolePolicy
+        #aws-permission @cft iam:DeleteRolePolicy
+        #aws-permission @cft iam:DetachRolePolicy
+        #aws-permission @cft iam:PutRolePolicy
+        - PolicyName: !Sub ${AWS::StackName}-graceful-shutdown-iam-role
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                - "ec2:DescribeInstances"
+                - "sqs:ReceiveMessage"
+                - "sqs:SendMessage"
+                - "sqs:DeleteMessage"
+                - "sqs:GetQueueAttributes"
+                - "sqs:GetQueueUrl"
+                - "logs:PutLogEvents"
+                - "logs:CreateLogStream"
+                - "logs:CreateLogGroup"
+                - "ec2:CreateNetworkInterface"
+                - "ec2:DescribeNetworkInterfaces"
+                - "ec2:DeleteNetworkInterface"
+                - "ec2:AttachNetworkInterfaces"
+                Resource:
+                  - "*"
+  
+  AutoScalingTerminationWaitLambdaIAMRole:
+    Type: AWS::IAM::Role
+    #aws-permission @cft iam:CreateRole
+    #aws-permission @cft iam:DeleteRole
+    #Condition: CreateIamInstanceProfile
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-asg-terminate-lambda-iam-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - lambda.amazonaws.com
+            Action: ['sts:AssumeRole']
+      Policies:
+        #aws-permission @cft iam:AttachRolePolicy
+        #aws-permission @cft iam:DeleteRolePolicy
+        #aws-permission @cft iam:DetachRolePolicy
+        #aws-permission @cft iam:PutRolePolicy
+        - PolicyName: !Sub ${AWS::StackName}-asg-terminate-lambda-iam-role
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                - "autoscaling:CompleteLifecycleAction"
+                - "sqs:ReceiveMessage"
+                - "sqs:SendMessage"
+                - "sqs:GetQueueUrl"
+                - "sqs:GetQueueAttributes"
+                - "sqs:DeleteMessage"
+                - "logs:PutLogEvents"
+                - "logs:CreateLogStream"
+                - "logs:CreateLogGroup"
+                - "ec2:CreateNetworkInterface"
+                - "ec2:DescribeNetworkInterfaces"
+                - "ec2:DeleteNetworkInterface"
+                - "ec2:AttachNetworkInterfaces"
+                - "ec2:Describe*"
+                Resource:
+                  - "*"
+
+  GracefulNodeShutdownQueue:
+    Type: 'AWS::SQS::Queue'
+    #aws-permission @cft sqs:CreateQueue
+    #aws-permission @cft sqs:DeleteQueue
+    #aws-permission @cft sqs:GetQueueAttributes
+    #aws-permission @cft sqs:TagQueue
+    Properties:
+      # This is required so that threads that handle those messages will not try to process the same message over and over again
+      # The value is higher than the usual graceful shutdown, so that in most cases there will not be a need to request
+      # more time. Otherwise if the handling thread is reaching 250s it will tell SQS to keep his message private for longer.
+      # See AWS docs on VisibilityTimeout for more details.
+      VisibilityTimeout: 250
+  AutoScalingTerminationWaitQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      VisibilityTimeout: 250
+
+  AutoScalingNotificationIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - autoscaling.amazonaws.com
+              - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AutoScalingNotificationAccessRole
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+
+  GracefulPrestoNodeShutdownHook:
+    Type: "AWS::AutoScaling::LifecycleHook"
+    #aws-permission @cft autoscaling:PutLifecycleHook
+    #aws-permission @cft autoscaling:DeleteLifecycleHook
+    Properties:
+      AutoScalingGroupName: !Ref Workers
+      LifecycleTransition: 'autoscaling:EC2_INSTANCE_TERMINATING'
+      NotificationTargetARN: !GetAtt GracefulNodeShutdownQueue.Arn
+      RoleARN: !GetAtt AutoScalingNotificationIAMRole.Arn
+      HeartbeatTimeout: 3600
+      DefaultResult: CONTINUE
+  GracefulNodeShutdownLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          from botocore.vendored import requests
+
+          def lambda_handler(event, context):
+              # TODO implement
+              print(event)
+              event_body = json.loads(event['Records'][0]["body"])
+              if event_body["LifecycleTransition"] != "autoscaling:EC2_INSTANCE_TERMINATING":
+                  print("Not a terminating condition return")
+                  return
+              ec2_instance_id = event_body["EC2InstanceId"]
+              instance_id = ec2_instance_id
+              ec2 = boto3.resource('ec2')
+              ec2_instance = ec2.Instance(instance_id)
+              ip = ec2_instance.private_ip_address
+              for i in range(3):
+                  try:
+                      url = 'http://{}:8080/v1/info/state'.format(ip)
+                      payload = "\"SHUTTING_DOWN\""
+                      headers = {
+                          'Content-Type': "application/json",
+                          'cache-control': "no-cache"
+                      }
+                  
+                      response = requests.request("PUT", url, data=payload, headers=headers)
+                      print(response.text)
+                  except Exception as e:
+                      pass
+              print(ip)
+              queue_url = os.getenv('QUEUE_URL')
+              print(queue_url)
+              sqs = boto3.client('sqs')
+              response = sqs.send_message(
+                  QueueUrl=queue_url,
+                  MessageBody=json.dumps(event_body)
+              )
+              print(response)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Hello from Lambda!')
+              }
+
+
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref AutoScalingTerminationWaitQueue
+          COORDINATOR_IP: !GetAtt CoordinatorENI.PrimaryPrivateIpAddress
+      Role: !GetAtt GracefulNodeShutdownQueueIAMRole.Arn
+      Timeout: 10
+      Handler: index.lambda_handler
+      Runtime: python3.6
+      VpcConfig:
+        SubnetIds: 
+          - !Ref Subnet
+        SecurityGroupIds: !Split
+          - ','
+          - !Join
+            - ','
+            - - !GetAtt PrestoSecurityGroup.GroupId
+              - !Join
+                - ','
+                - !Ref SecurityGroups
+
+  GracefulNodeShutdownLambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      EventSourceArn: !GetAtt GracefulNodeShutdownQueue.Arn
+      FunctionName: !GetAtt GracefulNodeShutdownLambda.Arn
+    DependsOn: 
+      - GracefulNodeShutdownLambda
+      - GracefulNodeShutdownQueue
+
+  AutoScalingTerminationWaitLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from botocore.vendored import requests
+
+          def lambda_handler(event, context):
+              # TODO implement
+
+              def enqueue_message(event_body):
+                  queue_url = os.getenv('QUEUE_URL')
+                  print(queue_url)
+                  sqs = boto3.client('sqs')
+                  response = sqs.send_message(
+                      QueueUrl=queue_url,
+                      MessageBody=json.dumps(event_body),
+                      DelaySeconds=60
+                  )
+                  print(response)
+
+              def complete_lifecycle(event_body):
+                  res = autoscaling.complete_lifecycle_action(
+                      LifecycleHookName=event_body["LifecycleHookName"],
+                      AutoScalingGroupName=event_body["AutoScalingGroupName"],
+                      LifecycleActionToken=event_body["LifecycleActionToken"],
+                      LifecycleActionResult='CONTINUE'
+                  )
+                  print(res)
+
+              event_body = json.loads(event['Records'][0]["body"])
+              if event_body["LifecycleTransition"] != "autoscaling:EC2_INSTANCE_TERMINATING":
+                  print("Not a terminating condition return")
+                  return
+              ec2_instance_id = event_body["EC2InstanceId"]
+              ec2 = boto3.resource("ec2")
+              autoscaling = boto3.client('autoscaling')
+              ec2_instance = ec2.Instance(ec2_instance_id)
+              ip = ec2_instance.private_ip_address
+              print(ec2_instance_id)
+              request_url = "http://{ip}:8080/v1/task".format(ip=ip, node_id=ec2_instance_id)
+              try:
+                  print(request_url)
+                  worker_tasks = requests.get(request_url)
+                  worker_tasks = worker_tasks.json()
+                  print(len(worker_tasks))
+                  for task in worker_tasks:
+                      if task['taskStatus']['state'] == 'RUNNING':
+                          print('RUNNING QUEURIES FOUND')
+                          enqueue_message(event_body)
+                          return
+
+                  print('NO_QUERIES')
+                  complete_lifecycle(event_body)
+                  return
+              except Exception as e:
+                  print(str(e))
+                  print("Terminating instance because worker not responding")
+                  complete_lifecycle(event_body)
+                  return
+
+
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref AutoScalingTerminationWaitQueue
+          COORDINATOR_IP: !GetAtt CoordinatorENI.PrimaryPrivateIpAddress
+      Role: !GetAtt AutoScalingTerminationWaitLambdaIAMRole.Arn
+      Timeout: 10
+      Handler: index.lambda_handler
+      Runtime: python3.6
+      VpcConfig:
+        SubnetIds: 
+          - !Ref Subnet
+        SecurityGroupIds: !Split
+          - ','
+          - !Join
+            - ','
+            - - !GetAtt PrestoSecurityGroup.GroupId
+              - !Join
+                - ','
+                - !Ref SecurityGroups
+  AutoScalingTerminationWaitLambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      EventSourceArn: !GetAtt AutoScalingTerminationWaitQueue.Arn
+      FunctionName: !GetAtt AutoScalingTerminationWaitLambda.Arn
+    DependsOn:
+      - AutoScalingTerminationWaitLambda
+      - AutoScalingTerminationWaitQueue
+
+  AutoScalingNotificationRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - autoscaling.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AutoScalingNotificationAccessRole
+
+  PrestoWorkersELB:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties: 
+      HealthCheck:
+        HealthyThreshold: 2
+        Interval: 15
+        Target: HTTP:8080/v1/status
+        Timeout: 10
+        UnhealthyThreshold: 2
+      Scheme: internal
+      Subnets: !Split
+        - ','
+        - !Join
+          - ','
+          - - !Ref Subnet
+      SecurityGroups: !Split
+          - ','
+          - !Join
+            - ','
+            - - !GetAtt PrestoSecurityGroup.GroupId
+              - !Join
+                - ','
+                - !Ref SecurityGroups
+      Listeners:
+        - InstancePort: 8080
+          InstanceProtocol: HTTP
+          LoadBalancerPort: 8080
+          Protocol: HTTP
+
+  PrestoCoordinatorsELB:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties: 
+      HealthCheck:
+        HealthyThreshold: 2
+        Interval: 15
+        Target: HTTP:8080/v1/status
+        Timeout: 10
+        UnhealthyThreshold: 2
+      Scheme: internal
+      Subnets: !Split
+        - ','
+        - !Join
+          - ','
+          - - !Ref Subnet
+      SecurityGroups: !Split
+          - ','
+          - !Join
+            - ','
+            - - !GetAtt PrestoSecurityGroup.GroupId
+              - !Join
+                - ','
+                - !Ref SecurityGroups
+      Listeners:
+        - InstancePort: 8080
+          InstanceProtocol: HTTP
+          LoadBalancerPort: 8080
+          Protocol: HTTP
+
+  HALambdaIamRole:
+    Type: AWS::IAM::Role
+    #aws-permission @cft iam:CreateRole
+    #aws-permission @cft iam:DeleteRole
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-HA-lambda-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Policies:
+        #aws-permission @cft iam:AttachRolePolicy
+        #aws-permission @cft iam:DeleteRolePolicy
+        #aws-permission @cft iam:DetachRolePolicy
+        #aws-permission @cft iam:PutRolePolicy
+        - PolicyName: !Sub ${AWS::StackName}-HA-lambda-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ec2:DescribeInstances"
+                  - "ec2:DescribeNetworkInterfaces"
+                  - "ec2:AttachNetworkInterface"
+                  - "ec2:DetachNetworkInterface"
+                  - "ec2:CreateNetworkInterface"
+                  - "ec2:DeleteNetworkInterface"
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - "*"
+  HALambda:
+    Type: AWS::Lambda::Function
+    DependsOn: Coordinators
+    Properties:
+      Role: !GetAtt HALambdaIamRole.Arn
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Runtime: python3.7
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import http.client
+          import time
+          import os
+
+          def detach_eni_instance(eniAttachmentId):
+              client = boto3.client('ec2')
+              print("detaching eni {}".format(eniAttachmentId))
+              response = client.detach_network_interface(
+                  AttachmentId = eniAttachmentId,
+                  Force = True
+              )
+              time.sleep(5)
+              print(response)
+              print("ENI detached")
+              
+          def attach_eni_instance(instanceId, eni_id):
+              client = boto3.client('ec2')
+              print("attaching eni {} to instance {}".format(eni_id, instanceId))
+              response = client.attach_network_interface(
+                  DeviceIndex=1,
+                  InstanceId = instanceId,
+                  NetworkInterfaceId = eni_id,
+              )
+              return response
+
+          def instance_health(instanceId):
+              client = boto3.client('ec2')
+              response = client.describe_instances(
+                  InstanceIds=[
+                      instanceId
+                  ]
+              )
+              print("checking health for instance {}".format(instanceId))
+              try:
+                  conn = http.client.HTTPConnection(response['Reservations'][0]['Instances'][0]['PrivateIpAddress'], 8080)
+                  conn.request("GET", "/v1/info")
+                  r1 = conn.getresponse()
+                  print(r1.status, r1.reason)
+                  data = json.loads(r1.read().decode('utf-8').replace("'", '"'))
+              except Exception as e:
+                  print("AN EXCEPTION OCCURED", str(e))
+                  data = {
+                      "starting": True
+                  }
+              return data
+              # return response
+              
+          def attach_eni(eni_id):
+              client = boto3.client('ec2')
+              response = client.describe_instances(
+                  Filters=[
+                      {
+                          'Name': 'tag:presto:opensource:identification:role',
+                          'Values': [
+                              'presto:coordinator'
+                          ]
+                      },
+                      {
+                          'Name': 'tag:aws:cloudformation:stack-name',
+                          'Values': [
+                              os.environ['STACK_NAME']
+                          ]
+                      }
+                  ]
+              )
+              for j in range(len(response['Reservations'])):
+                  for i in range(len(response['Reservations'][j]['Instances'])):
+                      if response['Reservations'][j]['Instances'][i]['State']['Name'] != 'running':
+                          continue
+                      privateIpAddress = response['Reservations'][j]['Instances'][i]['PrivateIpAddress']
+                      instanceId = response['Reservations'][j]['Instances'][i]['InstanceId']
+                      print("Found instance to attach {}, {}".format(privateIpAddress, instanceId))
+                      try:
+                          conn = http.client.HTTPConnection(privateIpAddress, 8080)
+                          conn.request("GET", "/v1/info")
+                          r1 = conn.getresponse()
+                          print(privateIpAddress, r1.status, r1.reason)
+                          data = json.loads(r1.read().decode('utf-8').replace("'", '"'))
+                      except Exception as e:
+                          print("AN EXCEPTION OCCURED", str(e))
+                          data = {
+                              "starting": True
+                          }
+                      if not data['starting']:
+                          print("Instance {} is healthy | Attaching ENI to Instance".format(instanceId))
+                          print(attach_eni_instance(instanceId, eni_id))
+                          break
+                      else:
+                          print(instanceId + "Instance is unhealthy ...")
+
+          def lambda_handler(event, context):
+              client = boto3.resource('ec2')
+              network_interface = client.NetworkInterface(os.environ['ENI_ID'])
+              print("Network ENI status: ", network_interface.status)
+              if network_interface.status == "available":
+                  print("ENI not attached to any coordinator | Looking for suitable coordinator")
+                  attach_eni(os.environ['ENI_ID'])
+              else:
+                  print("ENI is attached | Checking health of the coordinator")
+                  data = instance_health(network_interface.attachment['InstanceId'])
+                  # data = instance_health("i-0b9a126690a1fe099")
+                  if not data['starting']:
+                      print("Coordinator is healthy | EXITING")
+                  else:
+                      print("Coordinator is unhealthy | REPLACING")
+                      detach_eni_instance(network_interface.attachment['AttachmentId'])
+                      attach_eni(os.environ['ENI_ID'])
+
+
+      VpcConfig:
+        SubnetIds: 
+          - !Ref Subnet
+        SecurityGroupIds: !Split
+          - ','
+          - !Join
+            - ','
+            - - !GetAtt PrestoSecurityGroup.GroupId
+              - !Join
+                - ','
+                - !Ref SecurityGroups
+      Timeout: 60
+      Environment:
+        Variables:
+          ENI_ID: !Ref CoordinatorENI
+          STACK_NAME: !Sub ${AWS::StackName}
+  HALambdaTriggerRule:
+    Type: AWS::Events::Rule
+    #aws-permission @cft events:PutRule
+    #aws-permission @cft events:DeleteRule
+    #aws-permission @cft events:DescribeRule
+    #aws-permission @cft events:PutTargets
+    #aws-permission @cft events:RemoveTargets
+    DependsOn: Coordinators
+    Properties:
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt HALambda.Arn
+          Id: 'HALambda'
+  PermissionForEventsToInvokeHALambda:
+    Type: AWS::Lambda::Permission
+    #aws-permission @cft lambda:AddPermission
+    #aws-permission @cft lambda:RemovePermission
+    Properties:
+      FunctionName:
+        Ref: HALambda
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt HALambdaTriggerRule.Arn
+
+Outputs:
+  PrestoCoordinatorIp:
+    Description: Coordinator Instance Ip
+    Value: !GetAtt CoordinatorENI.PrimaryPrivateIpAddress
+  CoordinatorDashboard:
+    Description: Coordinator Dashboard URL
+    Value: !Sub "http://${CoordinatorENI.PrimaryPrivateIpAddress}:8080/ui"
